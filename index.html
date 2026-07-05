@@ -19,6 +19,9 @@
     background: #1a1a1a;
     image-rendering: auto;
     box-shadow: 0 0 80px #000 inset, 0 0 60px rgba(0,0,0,0.9);
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
   }
 </style>
 </head>
@@ -171,6 +174,54 @@ window.addEventListener('keydown', (e) => {
   keys[e.code] = true;
 });
 window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+/* ---------------- Touch controls (mobile) ---------------- */
+const TOUCH_CAPABLE = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+let touchUI = TOUCH_CAPABLE;
+const touchButtons = [
+  { id: 'left',   code: 'KeyA',      x: 92,   y: 592, r: 56, label: '◀' },
+  { id: 'right',  code: 'KeyD',      x: 226,  y: 592, r: 56, label: '▶' },
+  { id: 'jump',   code: 'Space',     x: 1192, y: 594, r: 58, label: 'LEAP' },
+  { id: 'crouch', code: 'KeyS',      x: 1062, y: 636, r: 44, label: 'CROUCH' },
+  { id: 'sprint', code: 'ShiftLeft', x: 1052, y: 516, r: 44, label: 'SPRINT' },
+  { id: 'act',    code: 'KeyE',      x: 1182, y: 458, r: 44, label: 'ACT' },
+  { id: 'bomb',   code: 'KeyQ',      x: 1066, y: 396, r: 38, label: 'BOMB' },
+  { id: 'grap',   code: 'KeyF',      x: 1186, y: 338, r: 38, label: 'HOOK' }
+];
+const touchHeld = {};
+function canvasPoint(t) {
+  const r = canvas.getBoundingClientRect();
+  return {
+    x: (t.clientX - r.left) * (VIEW_W / r.width),
+    y: (t.clientY - r.top) * (VIEW_H / r.height)
+  };
+}
+function handleTouches(e) {
+  e.preventDefault();
+  AudioSys.ensure();
+  touchUI = true;
+  // Any tap advances menu / game over / victory screens
+  if (e.type === 'touchstart' && G.state !== 'play' && G.state !== 'captured') {
+    pressed['Enter'] = true;
+  }
+  const hit = {};
+  for (const t of e.touches) {
+    const p = canvasPoint(t);
+    for (const b of touchButtons) {
+      if (dist(p.x, p.y, b.x, b.y) < b.r * 1.25) hit[b.id] = true;
+    }
+  }
+  for (const b of touchButtons) {
+    const was = !!touchHeld[b.id], is = !!hit[b.id];
+    if (is && !was) { if (!keys[b.code]) pressed[b.code] = true; keys[b.code] = true; }
+    else if (!is && was) { keys[b.code] = false; }
+    touchHeld[b.id] = is;
+  }
+}
+canvas.addEventListener('touchstart',  handleTouches, { passive: false });
+canvas.addEventListener('touchmove',   handleTouches, { passive: false });
+canvas.addEventListener('touchend',    handleTouches, { passive: false });
+canvas.addEventListener('touchcancel', handleTouches, { passive: false });
+
 const K = {
   left:   () => keys['ArrowLeft'] || keys['KeyA'],
   right:  () => keys['ArrowRight'] || keys['KeyD'],
@@ -1470,7 +1521,7 @@ function drawPrompts() {
     ctx.strokeRect(X - 72, Y - 18, 144, 26);
     ctx.fillStyle = WHITE;
     ctx.font = 'small-caps 700 15px Georgia, serif';
-    ctx.fillText('[E]  CUT ROPE', X, Y);
+    ctx.fillText(touchUI ? '[ACT]  CUT ROPE' : '[E]  CUT ROPE', X, Y);
   }
   if (rectsOverlap(p, door)) {
     const X = sx(door.x + door.w / 2), Y = sy(door.y - 54);
@@ -1631,6 +1682,34 @@ function drawUI() {
   ctx.restore();
 }
 
+/* --- on-screen touch buttons (stitched-ink style) --- */
+function drawTouchControls() {
+  if (!touchUI || G.state !== 'play') return;
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  for (const b of touchButtons) {
+    const held = touchHeld[b.id];
+    ctx.globalAlpha = held ? 0.9 : 0.42;
+    ctx.fillStyle = held ? 'rgba(220,218,205,0.28)' : 'rgba(10,10,10,0.5)';
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = held ? '#e8e5dc' : '#8a8a82';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([5, 4]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = held ? WHITE : '#cfcdc2';
+    ctx.font = b.label.length > 1
+      ? 'small-caps 700 ' + Math.round(b.r * 0.34) + 'px Georgia, serif'
+      : '700 30px Georgia, serif';
+    ctx.fillText(b.label, b.x, b.y + 1);
+  }
+  ctx.restore();
+  ctx.textBaseline = 'alphabetic';
+}
+
 /* ---------------- Overlays: parchment noise + vignette ---------------- */
 function drawGrainAndVignette() {
   ctx.save();
@@ -1700,7 +1779,7 @@ function drawMenu() {
 
   ctx.font = 'small-caps 700 22px Georgia, serif';
   ctx.fillStyle = 'rgba(235,233,225,' + (0.5 + 0.5 * Math.abs(Math.sin(G.t * 2.4))) + ')';
-  ctx.fillText('press ENTER to defy the Liturgy', VIEW_W / 2, 656);
+  ctx.fillText(touchUI ? 'tap to defy the Liturgy' : 'press ENTER to defy the Liturgy', VIEW_W / 2, 656);
 
   drawGrainAndVignette();
 }
@@ -1729,7 +1808,7 @@ function drawGameOver() {
   ctx.fillText('Pyre is dragged below, to scour the vats until his name is forgotten.', VIEW_W / 2, 350);
   ctx.font = 'small-caps 700 20px Georgia, serif';
   ctx.fillStyle = 'rgba(235,233,225,' + (0.5 + 0.5 * Math.abs(Math.sin(G.t * 2.4))) + ')';
-  ctx.fillText('press ENTER to rise again', VIEW_W / 2, 440);
+  ctx.fillText(touchUI ? 'tap to rise again' : 'press ENTER to rise again', VIEW_W / 2, 440);
   drawGrainAndVignette();
 }
 
@@ -1778,7 +1857,7 @@ function drawVictory() {
 
   ctx.font = 'small-caps 700 20px Georgia, serif';
   ctx.fillStyle = 'rgba(235,233,225,' + (0.5 + 0.5 * Math.abs(Math.sin(G.t * 2.4))) + ')';
-  ctx.fillText('press ENTER to play again', VIEW_W / 2, 640);
+  ctx.fillText(touchUI ? 'tap to play again' : 'press ENTER to play again', VIEW_W / 2, 640);
   drawGrainAndVignette();
 }
 
@@ -1805,6 +1884,7 @@ function render() {
   drawPrompts();
   drawGrainAndVignette();
   drawUI();
+  drawTouchControls();
 
   if (G.state === 'captured') drawCapturedOverlay();
 }
