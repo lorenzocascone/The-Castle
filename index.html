@@ -1,0 +1,1874 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Groaning Pile: Shadows of the Rafter-Lands</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #0b0b0b;
+    overflow: hidden;
+    font-family: Georgia, 'Palatino Linotype', serif;
+  }
+  #wrap {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+  }
+  canvas {
+    background: #1a1a1a;
+    image-rendering: auto;
+    box-shadow: 0 0 80px #000 inset, 0 0 60px rgba(0,0,0,0.9);
+  }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="1280" height="720"></canvas></div>
+<script>
+'use strict';
+/* ============================================================
+   THE GROANING PILE: SHADOWS OF THE RAFTER-LANDS
+   A 2D cinematic stealth-platformer.
+   Single-file build. Procedural ink-wash rendering, no assets.
+   ============================================================ */
+
+/* ---------------- Core constants ---------------- */
+const VIEW_W = 1280, VIEW_H = 720;
+const WORLD_W = 3600, WORLD_H = 900;
+const GRAV = 2200;
+
+const INK      = '#1a1a1a';
+const PAPER    = '#f5f2ea';
+const WHITE    = '#ffffff';
+const COPPER   = '#d97706';
+const GRAY_1   = '#2a2a2a';
+const GRAY_2   = '#3d3d3d';
+const GRAY_3   = '#575757';
+const GRAY_4   = '#7a7a7a';
+const GRAY_5   = '#a5a5a5';
+const SILH     = '#0d0d0d';
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+/* ---------------- Utility ---------------- */
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+const lerp  = (a, b, t) => a + (b - a) * t;
+const dist  = (x1, y1, x2, y2) => Math.hypot(x2 - x1, y2 - y1);
+const rectsOverlap = (a, b) =>
+  a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+
+/* Deterministic-ish flicker helper */
+function flick(t, seed) {
+  return Math.sin(t * 13 + seed * 7.1) * 0.5 + Math.sin(t * 29 + seed * 3.3) * 0.3 + Math.sin(t * 47 + seed) * 0.2;
+}
+
+/* ---------------- Tiny WebAudio synth (no assets) ---------------- */
+const AudioSys = {
+  ctx: null,
+  ensure() {
+    if (!this.ctx) {
+      try { this.ctx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { this.ctx = null; }
+    }
+    if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+  },
+  blip(freq, dur, vol, type) {
+    if (!this.ctx) return;
+    try {
+      const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+      o.type = type || 'triangle'; o.frequency.value = freq;
+      g.gain.setValueAtTime(vol, this.ctx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.0001, this.ctx.currentTime + dur);
+      o.connect(g); g.connect(this.ctx.destination);
+      o.start(); o.stop(this.ctx.currentTime + dur);
+    } catch (e) {}
+  },
+  noiseBurst(dur, vol, hp) {
+    if (!this.ctx) return;
+    try {
+      const n = Math.floor(this.ctx.sampleRate * dur);
+      const buf = this.ctx.createBuffer(1, n, this.ctx.sampleRate);
+      const d = buf.getChannelData(0);
+      for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+      const src = this.ctx.createBufferSource(); src.buffer = buf;
+      const f = this.ctx.createBiquadFilter(); f.type = 'highpass'; f.frequency.value = hp || 800;
+      const g = this.ctx.createGain(); g.gain.value = vol;
+      src.connect(f); f.connect(g); g.connect(this.ctx.destination);
+      src.start();
+    } catch (e) {}
+  },
+  crackSnap() { this.noiseBurst(0.05, 0.25, 2400); this.blip(180, 0.07, 0.12, 'square'); },
+  thud()      { this.blip(70, 0.12, 0.20, 'sine'); },
+  jump()      { this.blip(300, 0.08, 0.06, 'triangle'); },
+  cut()       { this.noiseBurst(0.12, 0.2, 1200); },
+  crash()     { this.noiseBurst(0.5, 0.4, 200); this.blip(50, 0.5, 0.3, 'sine'); },
+  caught()    { this.blip(120, 0.6, 0.25, 'sawtooth'); },
+  bomb()      { this.noiseBurst(0.25, 0.3, 500); },
+  win()       { this.blip(392, 0.4, 0.15, 'triangle'); setTimeout(() => this.blip(523, 0.8, 0.15, 'triangle'), 220); }
+};
+
+/* ---------------- Procedural textures ---------------- */
+function makeHatchPattern(size, gap, color, alpha, both) {
+  const c = document.createElement('canvas');
+  c.width = size; c.height = size;
+  const g = c.getContext('2d');
+  g.strokeStyle = color; g.globalAlpha = alpha; g.lineWidth = 1;
+  for (let i = -size; i < size * 2; i += gap) {
+    g.beginPath(); g.moveTo(i, 0); g.lineTo(i + size, size); g.stroke();
+    if (both) { g.beginPath(); g.moveTo(i + size, 0); g.lineTo(i, size); g.stroke(); }
+  }
+  return ctx.createPattern(c, 'repeat');
+}
+const hatchDark  = makeHatchPattern(22, 6, '#000000', 0.55, true);   // heavy crosshatch for darkness
+const hatchMid   = makeHatchPattern(26, 8, '#c9c9c9', 0.30, true);   // radar rings
+const hatchStone = makeHatchPattern(30, 10, '#000000', 0.18, false); // stone shading
+
+/* Parchment noise + ink splatter overlay (generated once) */
+const noiseC = document.createElement('canvas');
+noiseC.width = VIEW_W; noiseC.height = VIEW_H;
+(function buildNoise() {
+  const g = noiseC.getContext('2d');
+  const img = g.createImageData(VIEW_W, VIEW_H);
+  for (let i = 0; i < img.data.length; i += 4) {
+    const v = 128 + (Math.random() * 90 - 45);
+    img.data[i] = v; img.data[i + 1] = v; img.data[i + 2] = v;
+    img.data[i + 3] = Math.random() < 0.35 ? 26 : 8;
+  }
+  g.putImageData(img, 0, 0);
+  // Ink splatters
+  for (let s = 0; s < 26; s++) {
+    const sx = Math.random() * VIEW_W, sy = Math.random() * VIEW_H;
+    g.fillStyle = 'rgba(0,0,0,' + (0.10 + Math.random() * 0.20) + ')';
+    for (let d = 0; d < 14; d++) {
+      const a = Math.random() * Math.PI * 2, r = Math.random() * 22;
+      g.beginPath();
+      g.arc(sx + Math.cos(a) * r, sy + Math.sin(a) * r, Math.random() * 2.6 + 0.4, 0, Math.PI * 2);
+      g.fill();
+    }
+  }
+  // Charcoal smudges
+  for (let s = 0; s < 10; s++) {
+    g.fillStyle = 'rgba(0,0,0,0.05)';
+    g.beginPath();
+    g.ellipse(Math.random() * VIEW_W, Math.random() * VIEW_H,
+      40 + Math.random() * 120, 8 + Math.random() * 24, Math.random() * Math.PI, 0, Math.PI * 2);
+    g.fill();
+  }
+})();
+
+/* Darkness compositing layer */
+const darkC = document.createElement('canvas');
+darkC.width = VIEW_W; darkC.height = VIEW_H;
+const darkG = darkC.getContext('2d');
+
+/* ---------------- Input ---------------- */
+const keys = {};
+const pressed = {}; // edge-triggered
+window.addEventListener('keydown', (e) => {
+  AudioSys.ensure();
+  if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) e.preventDefault();
+  if (!keys[e.code]) pressed[e.code] = true;
+  keys[e.code] = true;
+});
+window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+const K = {
+  left:   () => keys['ArrowLeft'] || keys['KeyA'],
+  right:  () => keys['ArrowRight'] || keys['KeyD'],
+  up:     () => keys['ArrowUp'] || keys['KeyW'] || keys['Space'],
+  down:   () => keys['ArrowDown'] || keys['KeyS'],
+  sprint: () => keys['ShiftLeft'] || keys['ShiftRight'],
+  jumpP:  () => pressed['ArrowUp'] || pressed['KeyW'] || pressed['Space'],
+  interactP: () => pressed['KeyE'],
+  bombP:  () => pressed['KeyQ'],
+  grapP:  () => pressed['KeyF'],
+  enterP: () => pressed['Enter']
+};
+
+/* ---------------- Level geometry ---------------- */
+/* type: 'stone' | 'beam' | 'wall' ; oneWay beams can be dropped onto / grappled */
+const platforms = [
+  // Floor of the Grand Hall
+  { x: 0,    y: 820, w: WORLD_W, h: 80,  type: 'stone', oneWay: false },
+  // Start attic ledge (laundry-chute exit)
+  { x: 0,    y: 330, w: 300,     h: 26,  type: 'beam',  oneWay: false },
+  // Drop ledge
+  { x: 350,  y: 560, w: 190,     h: 22,  type: 'beam',  oneWay: true  },
+  // Chimney shaft walls (wall-jump climb). Left wall leaves a crawl gap at the floor.
+  { x: 580,  y: 260, w: 36,      h: 480, type: 'wall',  oneWay: false },
+  { x: 744,  y: 260, w: 36,      h: 560, type: 'wall',  oneWay: false },
+  // The great rafter beam across the hall
+  { x: 800,  y: 290, w: 1650,    h: 20,  type: 'beam',  oneWay: true  },
+  // Silt's dais
+  { x: 1690, y: 770, w: 230,     h: 50,  type: 'stone', oneWay: false },
+  // Descent platforms toward the Library Door
+  { x: 2520, y: 470, w: 180,     h: 20,  type: 'beam',  oneWay: true  },
+  { x: 2760, y: 620, w: 180,     h: 20,  type: 'beam',  oneWay: true  }
+];
+const solids  = platforms.filter(p => !p.oneWay);
+const oneWays = platforms.filter(p => p.oneWay);
+
+/* Decorative columns in the hall */
+const columns = [980, 1310, 2180, 2460].map(x => ({ x, y: 310, w: 46, h: 510 }));
+
+/* Lights: dynamic radial light sources. kind: 'candle'|'shaft'|'torch' */
+function makeLights() {
+  return [
+    { x: 470,  y: 250, r: 190, kind: 'shaft',  seed: 5, snuffed: 0 }, // chute skylight
+    { x: 1150, y: 480, r: 250, kind: 'shaft',  seed: 1, snuffed: 0 }, // stained-glass shaft
+    { x: 1480, y: 620, r: 235, kind: 'candle', seed: 2, snuffed: 0 }, // candelabra
+    { x: 1800, y: 560, r: 265, kind: 'candle', seed: 3, snuffed: 0 }, // pulpit candles
+    { x: 2100, y: 630, r: 225, kind: 'candle', seed: 4, snuffed: 0 }, // candelabra
+    { x: 2660, y: 640, r: 205, kind: 'candle', seed: 6, snuffed: 0 }, // lone candle
+    { x: 3330, y: 560, r: 215, kind: 'torch',  seed: 7, snuffed: 0 }  // torch by the Library Door
+  ];
+}
+
+/* The banner + rope sabotage */
+function makeBanner() {
+  return {
+    ropeX: 1830, ropeTopY: 300,
+    x: 1830 - 95, y: 312, w: 190, h: 330,
+    vy: 0, state: 'hanging', // hanging | falling | landed
+    sway: 0
+  };
+}
+
+/* Library Door */
+const door = { x: 3450, y: 646, w: 96, h: 174 };
+
+/* Checkpoints: spawn positions + trigger predicates */
+const checkpoints = [
+  { sx: 60,   sy: 274, hit: () => true },
+  { sx: 752,  sy: 200, hit: (p) => p.x > 740 && p.y < 320 },
+  { sx: 1600, sy: 232, hit: (p) => p.x > 1580 && p.y < 340 },
+  { sx: 2560, sy: 412, hit: (p) => p.x > 2520 && p.y < 560 }
+];
+
+/* ---------------- Entities ---------------- */
+function makePlayer() {
+  return {
+    x: 60, y: 274, w: 26, h: 56,
+    vx: 0, vy: 0,
+    facing: 1,
+    grounded: false, groundedPrev: false,
+    crouch: false,
+    coyote: 0,
+    wallDir: 0,        // -1 wall on left, 1 wall on right, 0 none
+    wallCling: 0,
+    health: 3,
+    stamina: 100, staminaLock: false,
+    inventory: ['Soot Bombs', 'Grapnel'],
+    bombs: 3,
+    grapple: null,     // {targetY, x}
+    grapCd: 0,
+    litFactor: 0,
+    awareness: 0,
+    invuln: 0,
+    animT: 0,
+    noise: 0           // current noise radius emitted
+  };
+}
+
+function makeGrizzle() {
+  return {
+    x: 2350, y: 820 - 86, w: 30, h: 86,
+    dir: 1, speed: 62,
+    minX: 2020, maxX: 2920,
+    state: 'patrol', targetX: 0,
+    snapTimer: 1.2,
+    stepT: 0
+  };
+}
+
+function makeGuards() {
+  const g = [];
+  // Kneeling congregation before the pulpit (capture on touch, weak radial senses)
+  for (let i = 0; i < 6; i++) {
+    g.push({
+      x: 1330 + i * 62, y: 820 - 40, w: 30, h: 40,
+      kind: 'kneel', dir: 1, speed: 0, minX: 0, maxX: 0,
+      blind: 0, seed: i
+    });
+  }
+  // Patrol wardens between hall and door
+  g.push({ x: 2560, y: 820 - 74, w: 28, h: 74, kind: 'patrol', dir: 1,  speed: 88, minX: 2480, maxX: 3080, blind: 0, seed: 20 });
+  g.push({ x: 3260, y: 820 - 74, w: 28, h: 74, kind: 'patrol', dir: -1, speed: 60, minX: 3140, maxX: 3400, blind: 0, seed: 21 });
+  return g;
+}
+
+/* Arch-Liturge Silt (boss, static at the pulpit until the banner falls) */
+function makeSilt() {
+  return { x: 1782, y: 770 - 130, w: 44, h: 130, buried: false, sway: 0 };
+}
+
+/* ---------------- Game state ---------------- */
+const G = {
+  state: 'menu', // menu | play | captured | gameover | victory
+  t: 0,
+  camX: 0, camY: 120,
+  shake: 0,
+  player: null, grizzle: null, guards: null, silt: null,
+  lights: null, banner: null,
+  pulses: [],      // radar rings {x,y,age}
+  snapText: 0,
+  bombsFly: [],    // {x,y,vx,vy}
+  smokes: [],      // {x,y,t}
+  blindAll: 0,     // banner-drop blindness window
+  escapeT: 0, escapeActive: false, escapeExpired: false,
+  alarm: false,
+  doorLocked: true,
+  checkpoint: 0,
+  capturedMsg: '', capturedT: 0,
+  objective: 'Reach the Library Door. Use the environment for chaos.',
+  msg: '', msgT: 0,
+  victoryT: 0
+};
+
+function resetRun(full) {
+  G.player = makePlayer();
+  G.grizzle = makeGrizzle();
+  G.guards = makeGuards();
+  G.silt = makeSilt();
+  G.lights = makeLights();
+  G.banner = makeBanner();
+  G.pulses = []; G.bombsFly = []; G.smokes = [];
+  G.blindAll = 0; G.escapeT = 0; G.escapeActive = false; G.escapeExpired = false;
+  G.alarm = false; G.doorLocked = true;
+  G.checkpoint = 0; G.shake = 0;
+  G.objective = 'Reach the Library Door. Use the environment for chaos.';
+  if (full) { /* nothing extra: full fresh run */ }
+}
+
+function respawn() {
+  const cp = checkpoints[G.checkpoint];
+  const p = G.player;
+  p.x = cp.sx; p.y = cp.sy; p.vx = 0; p.vy = 0;
+  p.awareness = 0; p.stamina = 100; p.staminaLock = false;
+  p.bombs = Math.max(p.bombs, 3);
+  p.invuln = 2.0; p.grapple = null;
+  G.alarm = false;
+  G.grizzle.state = 'patrol';
+  // Banner state persists (sabotage is permanent), blindness window does not.
+  G.blindAll = 0; G.escapeActive = false;
+  if (G.banner.state === 'landed') {
+    G.objective = 'The wardens stir again. Slip to the Library Door!';
+  }
+}
+
+function capture(reason) {
+  if (G.state !== 'play' || G.player.invuln > 0) return;
+  AudioSys.caught();
+  G.state = 'captured';
+  G.capturedMsg = reason;
+  G.capturedT = 1.7;
+  G.player.health -= 1;
+  G.shake = 0.5;
+}
+
+function showMsg(s, t) { G.msg = s; G.msgT = t || 2.4; }
+
+/* ---------------- Light queries ---------------- */
+function lightActive(L) { return L.snuffed <= 0; }
+function lightRadius(L) {
+  const f = L.kind === 'shaft' ? 0.03 : 0.09;
+  return L.r * (1 + f * flick(G.t, L.seed));
+}
+function litAt(cx, cy) {
+  let best = 0;
+  for (const L of G.lights) {
+    if (!lightActive(L)) continue;
+    const r = lightRadius(L) * 0.80;
+    const d = dist(cx, cy, L.x, L.y);
+    if (d < r) best = Math.max(best, 1 - d / r);
+  }
+  return best;
+}
+function inSmoke(cx, cy) {
+  for (const s of G.smokes) if (dist(cx, cy, s.x, s.y) < 240) return true;
+  return false;
+}
+
+/* ---------------- Player update ---------------- */
+function updatePlayer(dt) {
+  const p = G.player;
+  p.animT += dt;
+  p.invuln = Math.max(0, p.invuln - dt);
+  p.grapCd = Math.max(0, p.grapCd - dt);
+
+  /* Grapnel zip in progress */
+  if (p.grapple) {
+    const speed = 950;
+    p.y -= speed * dt;
+    p.vx = 0; p.vy = 0;
+    p.x = lerp(p.x, p.grapple.x, 10 * dt);
+    if (p.y <= p.grapple.targetY) {
+      p.y = p.grapple.targetY;
+      p.grapple = null;
+      p.grounded = true;
+    }
+    return;
+  }
+
+  /* Crouch */
+  const wantCrouch = K.down() && p.grounded;
+  if (wantCrouch && !p.crouch) { p.crouch = true; p.y += 22; p.h = 34; }
+  else if (!wantCrouch && p.crouch) {
+    // stand up if room above
+    const test = { x: p.x, y: p.y - 22, w: p.w, h: 56 };
+    let blocked = false;
+    for (const s of solids) if (rectsOverlap(test, s)) blocked = true;
+    if (!blocked) { p.crouch = false; p.y -= 22; p.h = 56; }
+  }
+
+  /* Stamina bookkeeping */
+  const canSpend = !p.staminaLock;
+  let spending = false;
+
+  /* Horizontal movement */
+  const sprinting = K.sprint() && canSpend && !p.crouch && (K.left() || K.right());
+  let speed = p.crouch ? 92 : (sprinting ? 335 : 205);
+  let ax = 0;
+  if (K.left())  { ax = -1; p.facing = -1; }
+  if (K.right()) { ax =  1; p.facing =  1; }
+  const accel = p.grounded ? 2600 : 1500;
+  if (ax !== 0) p.vx = clamp(p.vx + ax * accel * dt, -speed, speed);
+  else {
+    const fr = p.grounded ? 2200 : 400;
+    if (p.vx > 0) p.vx = Math.max(0, p.vx - fr * dt);
+    else p.vx = Math.min(0, p.vx + fr * dt);
+  }
+  if (sprinting && Math.abs(p.vx) > 200) { p.stamina -= 18 * dt; spending = true; }
+
+  /* Gravity + wall interactions */
+  p.vy += GRAV * dt;
+
+  // wall probe (airborne, pushing into a wall)
+  p.wallDir = 0;
+  if (!p.grounded) {
+    const probeL = { x: p.x - 3, y: p.y + 8, w: 3, h: p.h - 16 };
+    const probeR = { x: p.x + p.w, y: p.y + 8, w: 3, h: p.h - 16 };
+    for (const s of solids) {
+      if (s.type !== 'wall' && s.type !== 'stone') continue;
+      if (rectsOverlap(probeL, s)) p.wallDir = -1;
+      if (rectsOverlap(probeR, s)) p.wallDir = 1;
+    }
+  }
+  const clinging = p.wallDir !== 0 && !p.grounded && ((p.wallDir === -1 && K.left()) || (p.wallDir === 1 && K.right()));
+  if (clinging && p.vy > 0 && canSpend) {
+    p.vy = Math.min(p.vy, 150); // wall slide
+    p.stamina -= 14 * dt; spending = true;
+  }
+  p.vy = Math.min(p.vy, 1400);
+
+  /* Jumping */
+  p.coyote = p.grounded ? 0.09 : Math.max(0, p.coyote - dt);
+  if (K.jumpP()) {
+    if (p.coyote > 0 && !p.crouch) {
+      p.vy = -760; p.coyote = 0; AudioSys.jump();
+    } else if (clinging || (p.wallDir !== 0 && !p.grounded)) {
+      if (canSpend && p.stamina >= 8) {
+        p.vy = -690;
+        p.vx = -p.wallDir * 390;
+        p.facing = -p.wallDir;
+        p.stamina -= 10;
+        AudioSys.jump();
+      }
+    }
+  }
+
+  /* Integrate + collide: X axis */
+  p.x += p.vx * dt;
+  p.x = clamp(p.x, 0, WORLD_W - p.w);
+  for (const s of solids) {
+    if (!rectsOverlap(p, s)) continue;
+    if (p.vx > 0) p.x = s.x - p.w;
+    else if (p.vx < 0) p.x = s.x + s.w;
+    else p.x = (p.x + p.w / 2 < s.x + s.w / 2) ? s.x - p.w : s.x + s.w;
+    p.vx = 0;
+  }
+
+  /* Integrate + collide: Y axis */
+  const prevBottom = p.y + p.h;
+  p.y += p.vy * dt;
+  p.groundedPrev = p.grounded;
+  p.grounded = false;
+  for (const s of solids) {
+    if (!rectsOverlap(p, s)) continue;
+    if (p.vy > 0 && prevBottom <= s.y + 6) {
+      p.y = s.y - p.h; p.vy = 0; p.grounded = true;
+    } else if (p.vy < 0) {
+      p.y = s.y + s.h; p.vy = 0;
+    } else {
+      p.y = s.y - p.h; p.vy = 0; p.grounded = true;
+    }
+  }
+  for (const s of oneWays) {
+    if (p.vy < 0) continue;
+    if (K.down() && !p.grounded && p.crouch) continue;
+    if (!rectsOverlap(p, s)) continue;
+    if (prevBottom <= s.y + 8) { p.y = s.y - p.h; p.vy = 0; p.grounded = true; }
+  }
+  // Drop-through a beam: crouch + jump
+  if (p.grounded && p.crouch && K.jumpP()) {
+    for (const s of oneWays) {
+      if (Math.abs((p.y + p.h) - s.y) < 4 && p.x + p.w > s.x && p.x < s.x + s.w) {
+        p.y += 10; p.grounded = false; p.vy = 120;
+        break;
+      }
+    }
+  }
+
+  /* Landing thud noise */
+  let landed = false;
+  if (p.grounded && !p.groundedPrev) { landed = true; AudioSys.thud(); }
+
+  /* Stamina regen / lock hysteresis */
+  if (!spending) p.stamina += 24 * dt;
+  p.stamina = clamp(p.stamina, 0, 100);
+  if (p.stamina <= 0.5) p.staminaLock = true;
+  if (p.stamina >= 18) p.staminaLock = false;
+
+  /* Noise emission (Grizzle hears this) */
+  const moving = Math.abs(p.vx) > 30 && p.grounded;
+  p.noise = 0;
+  if (landed) p.noise = 270;
+  else if (moving && sprinting) p.noise = 330;
+  else if (moving && !p.crouch) p.noise = 150;
+  else if (moving && p.crouch) p.noise = 24;
+
+  /* Lit factor + awareness */
+  const cx = p.x + p.w / 2, cy = p.y + p.h / 2;
+  p.litFactor = litAt(cx, cy);
+
+  let seenRate = 0;
+  if (p.litFactor > 0.02 && G.blindAll <= 0) {
+    for (const g of G.guards) {
+      if (g.blind > 0) continue;
+      const gx = g.x + g.w / 2, gy = g.y + g.h / 2;
+      if (inSmoke(gx, gy)) continue;
+      const dx = cx - gx, dy = cy - gy;
+      if (g.kind === 'patrol') {
+        if (Math.sign(dx) === g.dir && Math.abs(dx) < 470 && Math.abs(dy) < 170)
+          seenRate = Math.max(seenRate, 58 * p.litFactor);
+      } else { // kneeling worshippers: dim peripheral senses
+        if (Math.abs(dx) < 230 && Math.abs(dy) < 120)
+          seenRate = Math.max(seenRate, 30 * p.litFactor);
+      }
+    }
+    // Arch-Liturge Silt surveys his flock
+    if (!G.silt.buried) {
+      const sx = G.silt.x + G.silt.w / 2, sy = G.silt.y + G.silt.h / 2;
+      if (dist(cx, cy, sx, sy) < 430 && !inSmoke(sx, sy))
+        seenRate = Math.max(seenRate, 42 * p.litFactor);
+    }
+  }
+  if (G.alarm) seenRate = Math.max(seenRate, p.litFactor > 0.02 ? 95 * p.litFactor : 0);
+  if (seenRate > 0) p.awareness += seenRate * dt;
+  else p.awareness -= 32 * dt;
+  p.awareness = clamp(p.awareness, 0, 100);
+  if (p.awareness >= 100) {
+    capture('The wardens seized you in the light.');
+    return;
+  }
+
+  /* Touch captures */
+  if (p.invuln <= 0) {
+    for (const g of G.guards) {
+      if (g.blind > 0 || G.blindAll > 0) continue;
+      if (rectsOverlap(p, g)) { capture('Cold hands. A guard has you.'); return; }
+    }
+    if (rectsOverlap(p, G.grizzle)) { capture('Grizzle’s fingers close around your throat.'); return; }
+    if (!G.silt.buried && rectsOverlap(p, G.silt)) { capture('The Arch-Liturge himself pronounces your sentence.'); return; }
+  }
+
+  /* Checkpoints */
+  for (let i = checkpoints.length - 1; i > G.checkpoint; i--) {
+    if (checkpoints[i].hit(p)) { G.checkpoint = i; break; }
+  }
+
+  /* --- Interactions (E) --- */
+  if (K.interactP()) {
+    // Cut the banner rope from the rafter beam
+    const b = G.banner;
+    if (b.state === 'hanging' &&
+        Math.abs((p.x + p.w / 2) - b.ropeX) < 70 && Math.abs((p.y + p.h) - 290) < 60) {
+      b.state = 'falling';
+      AudioSys.cut();
+      showMsg('The hemp parts under the Scullery Skewer…', 2);
+    }
+    // The Library Door
+    if (rectsOverlap(p, door)) {
+      if (G.doorLocked) showMsg('Sealed by Ritual Law. Bring chaos first.', 2.2);
+    }
+  }
+  // Victory: touch the unlocked door
+  if (!G.doorLocked && rectsOverlap(p, door)) {
+    G.state = 'victory'; G.victoryT = 0;
+    AudioSys.win();
+    return;
+  }
+
+  /* --- Soot bomb (Q) --- */
+  if (K.bombP() && p.bombs > 0) {
+    p.bombs--;
+    G.bombsFly.push({ x: cx, y: p.y + 8, vx: p.facing * 420 + p.vx * 0.4, vy: -260 });
+    AudioSys.blip(500, 0.05, 0.05, 'square');
+  }
+
+  /* --- Grapnel (F) --- */
+  if (K.grapP() && p.grapCd <= 0 && canSpend && p.stamina >= 25) {
+    let best = null, bestD = 1e9;
+    for (const s of oneWays) {
+      if (s.y >= p.y - 30) continue;
+      if (cx < s.x - 14 || cx > s.x + s.w + 14) continue;
+      const d = p.y - s.y;
+      if (d < 380 && d < bestD) { bestD = d; best = s; }
+    }
+    if (best) {
+      p.grapple = { targetY: best.y - p.h, x: clamp(cx - p.w / 2, best.x, best.x + best.w - p.w) };
+      p.stamina -= 25; p.grapCd = 0.6; p.vy = 0;
+      AudioSys.blip(700, 0.1, 0.06, 'triangle');
+    } else {
+      showMsg('No beam within the Grapnel’s reach.', 1.4);
+    }
+  }
+}
+
+/* ---------------- Grizzle: the Click-Snap stalker ---------------- */
+function updateGrizzle(dt) {
+  const z = G.grizzle, p = G.player;
+  z.stepT += dt;
+
+  // Hearing: blind, but supernaturally attuned to sound
+  const pcx = p.x + p.w / 2;
+  if (p.noise > 0 && G.state === 'play') {
+    const hear = p.noise + 60;
+    if (Math.abs(pcx - (z.x + z.w / 2)) < hear && Math.abs((p.y + p.h) - (z.y + z.h)) < 260) {
+      z.state = 'investigate';
+      z.targetX = clamp(pcx, z.minX, z.maxX);
+    }
+  }
+
+  let sp = z.speed * (G.alarm ? 1.9 : 1);
+  if (z.state === 'investigate') {
+    sp *= 2.1;
+    const d = z.targetX - z.x;
+    if (Math.abs(d) < 8) z.state = 'patrol';
+    else z.dir = Math.sign(d);
+  } else {
+    if (z.x <= z.minX) z.dir = 1;
+    if (z.x + z.w >= z.maxX) z.dir = -1;
+  }
+  z.x += z.dir * sp * dt;
+  z.x = clamp(z.x, z.minX, z.maxX - z.w);
+
+  // The Click-Snap Radar: every 3 seconds his knees betray him
+  z.snapTimer -= dt;
+  if (z.snapTimer <= 0) {
+    z.snapTimer = 3.0;
+    G.pulses.push({ x: z.x + z.w / 2, y: z.y + z.h * 0.6, age: 0 });
+    G.snapText = 0.8;
+    AudioSys.crackSnap();
+  }
+  for (const pu of G.pulses) pu.age += dt;
+  G.pulses = G.pulses.filter(pu => pu.age < 1.5);
+  G.snapText = Math.max(0, G.snapText - dt);
+}
+
+/* ---------------- Guards ---------------- */
+function updateGuards(dt) {
+  for (const g of G.guards) {
+    g.blind = Math.max(0, g.blind - dt);
+    if (g.kind !== 'patrol') continue;
+    if (g.blind > 0 || G.blindAll > 0) continue; // stumbling, blinded
+    g.x += g.dir * g.speed * dt;
+    if (g.x <= g.minX) { g.x = g.minX; g.dir = 1; }
+    if (g.x + g.w >= g.maxX) { g.x = g.maxX - g.w; g.dir = -1; }
+  }
+}
+
+/* ---------------- Banner physics + sabotage trigger ---------------- */
+function updateBanner(dt) {
+  const b = G.banner;
+  b.sway = Math.sin(G.t * 1.1) * 5;
+  if (b.state === 'falling') {
+    b.vy += GRAV * 0.85 * dt;
+    b.y += b.vy * dt;
+    const daisTop = 770;
+    if (b.y + b.h >= daisTop) {
+      b.y = daisTop - b.h;
+      b.state = 'landed';
+      AudioSys.crash();
+      G.shake = 0.8;
+      // The Great Sabotage: banner smothers Arch-Liturge Silt, guards blinded
+      G.silt.buried = true;
+      G.blindAll = 10;
+      for (const g of G.guards) g.blind = 10;
+      G.escapeActive = true; G.escapeT = 10; G.escapeExpired = false;
+      G.doorLocked = false;
+      G.objective = 'CHAOS! Escape through the Library Door!';
+      showMsg('The banner smothers the Arch-Liturge! RUN!', 3);
+    }
+  }
+}
+
+/* ---------------- Bombs & smoke ---------------- */
+function updateBombs(dt) {
+  for (const b of G.bombsFly) {
+    b.vy += GRAV * 0.9 * dt;
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    let hit = b.y > 812;
+    for (const s of platforms) {
+      if (b.x > s.x && b.x < s.x + s.w && b.y > s.y && b.y < s.y + s.h) hit = true;
+    }
+    if (b.x < 0 || b.x > WORLD_W) hit = true;
+    if (hit) {
+      b.dead = true;
+      G.smokes.push({ x: b.x, y: Math.min(b.y, 812), t: 5 });
+      AudioSys.bomb();
+      // Snuff nearby small flames (candles & torches, not god's own daylight)
+      for (const L of G.lights) {
+        if (L.kind === 'shaft') continue;
+        if (dist(b.x, b.y, L.x, L.y) < 190) L.snuffed = Math.max(L.snuffed, 14);
+      }
+      // Blind guards caught in the soot cloud
+      for (const g of G.guards) {
+        if (dist(b.x, b.y, g.x + g.w / 2, g.y + g.h / 2) < 260) g.blind = Math.max(g.blind, 5);
+      }
+    }
+  }
+  G.bombsFly = G.bombsFly.filter(b => !b.dead);
+  for (const s of G.smokes) s.t -= dt;
+  G.smokes = G.smokes.filter(s => s.t > 0);
+}
+
+/* ---------------- Escape timer ---------------- */
+function updateEscape(dt) {
+  if (G.blindAll > 0) G.blindAll = Math.max(0, G.blindAll - dt);
+  for (const L of G.lights) L.snuffed = Math.max(0, L.snuffed - dt);
+  if (G.escapeActive) {
+    G.escapeT -= dt;
+    if (G.escapeT <= 0) {
+      G.escapeActive = false;
+      G.escapeExpired = true;
+      G.alarm = true;
+      G.blindAll = 0;
+      for (const g of G.guards) g.blind = 0;
+      G.objective = 'ALARM! The wardens hunt you. The door still stands open!';
+      showMsg('The wardens tear the cloth from their eyes!', 2.6);
+    }
+  }
+}
+
+/* ---------------- Camera ---------------- */
+function updateCamera(dt) {
+  const p = G.player;
+  const tx = clamp(p.x + p.w / 2 - VIEW_W / 2, 0, WORLD_W - VIEW_W);
+  const ty = clamp(p.y + p.h / 2 - VIEW_H * 0.55, 0, WORLD_H - VIEW_H);
+  G.camX = lerp(G.camX, tx, clamp(6 * dt, 0, 1));
+  G.camY = lerp(G.camY, ty, clamp(6 * dt, 0, 1));
+  G.shake = Math.max(0, G.shake - dt);
+}
+
+/* ============================================================
+   RENDERING
+   ============================================================ */
+function sx(x) { return x - G.camX + (G.shake > 0 ? (Math.random() - 0.5) * G.shake * 22 : 0); }
+function sy(y) { return y - G.camY + (G.shake > 0 ? (Math.random() - 0.5) * G.shake * 22 : 0); }
+
+/* --- background architecture --- */
+function drawBackground() {
+  // Deep charcoal wash
+  const bg = ctx.createLinearGradient(0, 0, 0, VIEW_H);
+  bg.addColorStop(0, '#4a4a48');
+  bg.addColorStop(0.55, '#5c5b56');
+  bg.addColorStop(1, '#3e3e3c');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+  // Distant vaulted arches (parallax 0.5)
+  ctx.save();
+  const px = -G.camX * 0.5, py = -G.camY * 0.5;
+  ctx.strokeStyle = 'rgba(30,30,30,0.45)';
+  ctx.lineWidth = 3;
+  for (let i = 0; i < 12; i++) {
+    const ax = px + i * 420 + 120;
+    ctx.beginPath();
+    ctx.moveTo(ax, py + 620);
+    ctx.quadraticCurveTo(ax + 150, py + 90, ax + 300, py + 620);
+    ctx.stroke();
+  }
+  // faint high window slits
+  ctx.fillStyle = 'rgba(220,218,205,0.22)';
+  for (let i = 0; i < 8; i++) {
+    const wx = px + i * 560 + 300;
+    ctx.beginPath();
+    ctx.moveTo(wx, py + 140); ctx.lineTo(wx + 22, py + 100); ctx.lineTo(wx + 44, py + 140);
+    ctx.lineTo(wx + 44, py + 260); ctx.lineTo(wx, py + 260); ctx.closePath();
+    ctx.fill();
+  }
+  ctx.restore();
+
+  // Columns of the Ritual Hall
+  for (const c of columns) {
+    const X = sx(c.x), Y = sy(c.y);
+    ctx.fillStyle = '#6e6d66';
+    ctx.fillRect(X, Y, c.w, c.h);
+    ctx.fillStyle = hatchStone;
+    ctx.fillRect(X, Y, c.w, c.h);
+    // capital & base
+    ctx.fillStyle = '#7a7972';
+    ctx.fillRect(X - 8, Y, c.w + 16, 16);
+    ctx.fillRect(X - 8, Y + c.h - 16, c.w + 16, 16);
+    ctx.strokeStyle = '#1f1f1f';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(X, Y, c.w, c.h);
+  }
+
+  // The stained-glass shaft (visual beam of light)
+  const shaft = G.lights[1];
+  if (lightActive(shaft)) {
+    ctx.save();
+    ctx.globalAlpha = 0.10 + 0.02 * flick(G.t, 9);
+    ctx.fillStyle = PAPER;
+    ctx.beginPath();
+    ctx.moveTo(sx(shaft.x - 60), sy(-40));
+    ctx.lineTo(sx(shaft.x + 60), sy(-40));
+    ctx.lineTo(sx(shaft.x + 190), sy(760));
+    ctx.lineTo(sx(shaft.x - 190), sy(760));
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+/* --- platforms --- */
+function drawPlatforms() {
+  for (const p of platforms) {
+    const X = sx(p.x), Y = sy(p.y);
+    if (X + p.w < -60 || X > VIEW_W + 60) continue;
+    if (p.type === 'stone') {
+      ctx.fillStyle = '#75746c';
+      ctx.fillRect(X, Y, p.w, p.h);
+      ctx.fillStyle = hatchStone;
+      ctx.fillRect(X, Y, p.w, p.h);
+      ctx.strokeStyle = '#8f8e85';
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(X, Y + 1); ctx.lineTo(X + p.w, Y + 1); ctx.stroke();
+      // flagstone seams
+      ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+      for (let fx = Math.floor(p.x / 90) * 90; fx < p.x + p.w; fx += 90) {
+        if (fx < p.x) continue;
+        ctx.beginPath(); ctx.moveTo(sx(fx), Y + 4); ctx.lineTo(sx(fx), Y + p.h); ctx.stroke();
+      }
+    } else if (p.type === 'beam') {
+      ctx.fillStyle = '#5c5348';
+      ctx.fillRect(X, Y, p.w, p.h);
+      ctx.strokeStyle = '#2a251f';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(X, Y, p.w, p.h);
+      // wood grain
+      ctx.strokeStyle = 'rgba(0,0,0,0.4)';
+      ctx.lineWidth = 1;
+      for (let gx = p.x + 18; gx < p.x + p.w; gx += 42) {
+        ctx.beginPath();
+        ctx.moveTo(sx(gx), Y + 4);
+        ctx.lineTo(sx(gx + 22), Y + p.h - 4);
+        ctx.stroke();
+      }
+    } else { // wall (chimney brick)
+      ctx.fillStyle = '#66655e';
+      ctx.fillRect(X, Y, p.w, p.h);
+      ctx.strokeStyle = 'rgba(0,0,0,0.45)';
+      ctx.lineWidth = 1;
+      for (let by = p.y; by < p.y + p.h; by += 22) {
+        ctx.beginPath(); ctx.moveTo(X, sy(by)); ctx.lineTo(X + p.w, sy(by)); ctx.stroke();
+      }
+      ctx.strokeStyle = '#1f1f1f';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(X, Y, p.w, p.h);
+    }
+  }
+}
+
+/* --- candelabra & torch fixtures (stands only; flames drawn above darkness) --- */
+function drawFixtures() {
+  for (const L of G.lights) {
+    if (L.kind === 'candle') {
+      const X = sx(L.x), Yb = sy(820);
+      ctx.strokeStyle = SILH;
+      ctx.lineWidth = 5;
+      ctx.beginPath(); ctx.moveTo(X, Yb); ctx.lineTo(X, sy(L.y + 16)); ctx.stroke();
+      // arms
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.moveTo(X - 34, sy(L.y + 18)); ctx.quadraticCurveTo(X, sy(L.y + 40), X + 34, sy(L.y + 18));
+      ctx.stroke();
+      // candle bodies
+      ctx.fillStyle = '#c9c4b4';
+      ctx.fillRect(X - 37, sy(L.y + 2), 6, 16);
+      ctx.fillRect(X - 3,  sy(L.y - 6), 6, 22);
+      ctx.fillRect(X + 31, sy(L.y + 2), 6, 16);
+      // base
+      ctx.fillStyle = SILH;
+      ctx.beginPath(); ctx.ellipse(X, Yb, 26, 8, 0, 0, Math.PI * 2); ctx.fill();
+    } else if (L.kind === 'torch') {
+      const X = sx(L.x), Y = sy(L.y);
+      ctx.strokeStyle = SILH;
+      ctx.lineWidth = 6;
+      ctx.beginPath(); ctx.moveTo(X, Y + 46); ctx.lineTo(X, Y + 10); ctx.stroke();
+      ctx.fillStyle = '#3a3a3a';
+      ctx.fillRect(X - 6, Y + 4, 12, 12);
+    }
+  }
+}
+
+/* --- pulpit, Silt, congregation --- */
+function drawSiltAndFlock() {
+  // Dais steps
+  const dais = platforms[6];
+  ctx.fillStyle = '#7d7c74';
+  ctx.fillRect(sx(dais.x + 30), sy(dais.y - 18), dais.w - 60, 18);
+  // Pulpit
+  const puX = sx(1770), puY = sy(770 - 64);
+  ctx.fillStyle = SILH;
+  ctx.beginPath();
+  ctx.moveTo(puX, puY + 64); ctx.lineTo(puX + 10, puY + 8); ctx.lineTo(puX + 58, puY + 8);
+  ctx.lineTo(puX + 68, puY + 64); ctx.closePath();
+  ctx.fill();
+
+  const s = G.silt;
+  if (!s.buried) {
+    s.sway = Math.sin(G.t * 1.6) * 3;
+    const X = sx(s.x), Y = sy(s.y);
+    ctx.fillStyle = SILH;
+    // Decaying ceremonial robes: towering triangular mass
+    ctx.beginPath();
+    ctx.moveTo(X - 14, Y + s.h);
+    ctx.lineTo(X + 8 + s.sway, Y + 18);
+    ctx.lineTo(X + s.w - 8 + s.sway, Y + 18);
+    ctx.lineTo(X + s.w + 14, Y + s.h);
+    ctx.closePath();
+    ctx.fill();
+    // Cowled head
+    ctx.beginPath();
+    ctx.arc(X + s.w / 2 + s.sway, Y + 10, 14, 0, Math.PI * 2);
+    ctx.fill();
+    // Gesturing arm (aggressive monotone sermon)
+    ctx.strokeStyle = SILH;
+    ctx.lineWidth = 8;
+    ctx.beginPath();
+    ctx.moveTo(X + 4 + s.sway, Y + 34);
+    ctx.lineTo(X - 26 + s.sway + Math.sin(G.t * 3) * 6, Y + 20 + Math.cos(G.t * 3) * 5);
+    ctx.stroke();
+    // The heavy staff
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(X + s.w + 8, sy(770));
+    ctx.lineTo(X + s.w + 14 + s.sway, Y - 6);
+    ctx.stroke();
+  }
+
+  // Kneeling congregation silhouettes
+  for (const g of G.guards) {
+    if (g.kind !== 'kneel') continue;
+    const X = sx(g.x), Y = sy(g.y);
+    const bow = Math.sin(G.t * 0.9 + g.seed) * 2;
+    ctx.fillStyle = SILH;
+    ctx.beginPath();
+    ctx.moveTo(X, Y + g.h);
+    ctx.quadraticCurveTo(X + 4, Y + 8 + bow, X + g.w * 0.55, Y + 4 + bow);
+    ctx.quadraticCurveTo(X + g.w, Y + 14 + bow, X + g.w, Y + g.h);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(X + g.w * 0.62, Y + 4 + bow, 7, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+/* --- patrol guards --- */
+function drawPatrolGuards() {
+  for (const g of G.guards) {
+    if (g.kind !== 'patrol') continue;
+    const X = sx(g.x), Y = sy(g.y);
+    const stumble = (g.blind > 0 || G.blindAll > 0) ? Math.sin(G.t * 10 + g.seed) * 4 : 0;
+    const step = Math.sin(G.t * 8 + g.seed) * (g.blind > 0 || G.blindAll > 0 ? 1 : 5);
+    ctx.fillStyle = SILH;
+    // hooded body
+    ctx.beginPath();
+    ctx.moveTo(X + stumble, Y + g.h);
+    ctx.lineTo(X + 4 + stumble, Y + 12);
+    ctx.quadraticCurveTo(X + g.w / 2 + stumble, Y - 6, X + g.w - 4 + stumble, Y + 12);
+    ctx.lineTo(X + g.w + stumble, Y + g.h);
+    ctx.closePath();
+    ctx.fill();
+    // legs
+    ctx.strokeStyle = SILH;
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.moveTo(X + g.w / 2 + stumble, Y + g.h - 22);
+    ctx.lineTo(X + g.w / 2 - 7 + step + stumble, Y + g.h);
+    ctx.moveTo(X + g.w / 2 + stumble, Y + g.h - 22);
+    ctx.lineTo(X + g.w / 2 + 7 - step + stumble, Y + g.h);
+    ctx.stroke();
+    // pike
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(X + (g.dir > 0 ? g.w + 4 : -4) + stumble, Y + g.h);
+    ctx.lineTo(X + (g.dir > 0 ? g.w + 10 : -10) + stumble, Y - 26);
+    ctx.stroke();
+    // blinded scribble over eyes
+    if (g.blind > 0 || G.blindAll > 0) {
+      ctx.strokeStyle = GRAY_4;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      for (let i = 0; i < 4; i++) {
+        ctx.moveTo(X - 4 + i * 8 + stumble, Y + 2 + Math.sin(G.t * 20 + i) * 3);
+        ctx.lineTo(X + 4 + i * 8 + stumble, Y + 8);
+      }
+      ctx.stroke();
+    }
+  }
+}
+
+/* --- Grizzle --- */
+function drawGrizzle(aboveDark) {
+  const z = G.grizzle;
+  const X = sx(z.x), Y = sy(z.y);
+  const step = Math.sin(z.stepT * 5);
+  ctx.save();
+  if (aboveDark) {
+    // Silhouette reveal while a radar pulse rings
+    let a = 0;
+    for (const pu of G.pulses) a = Math.max(a, 1 - pu.age / 1.5);
+    if (a <= 0) { ctx.restore(); return; }
+    ctx.globalAlpha = a * 0.9;
+    ctx.fillStyle = '#e8e8e8';
+    ctx.strokeStyle = '#e8e8e8';
+  } else {
+    ctx.fillStyle = SILH;
+    ctx.strokeStyle = SILH;
+  }
+  // Terrifyingly thin, elongated silhouette
+  ctx.lineWidth = 5;
+  // spine (hunched)
+  ctx.beginPath();
+  ctx.moveTo(X + 15, Y + z.h - 34);
+  ctx.quadraticCurveTo(X + 15 - z.dir * 6, Y + 26, X + 15 + z.dir * 10, Y + 10);
+  ctx.stroke();
+  // head (small, jutting forward)
+  ctx.beginPath();
+  ctx.arc(X + 15 + z.dir * 14, Y + 8, 8, 0, Math.PI * 2);
+  ctx.fill();
+  // stiff cracking legs
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(X + 15, Y + z.h - 34);
+  ctx.lineTo(X + 15 + step * 9, Y + z.h - 16);
+  ctx.lineTo(X + 15 + step * 12, Y + z.h);
+  ctx.moveTo(X + 15, Y + z.h - 34);
+  ctx.lineTo(X + 15 - step * 9, Y + z.h - 16);
+  ctx.lineTo(X + 15 - step * 12, Y + z.h);
+  ctx.stroke();
+  // long groping arms
+  ctx.beginPath();
+  ctx.moveTo(X + 15 + z.dir * 4, Y + 24);
+  ctx.lineTo(X + 15 + z.dir * 26, Y + 52 + Math.sin(G.t * 2) * 6);
+  ctx.stroke();
+  ctx.restore();
+}
+
+/* --- radar pulses (drawn ABOVE the darkness) --- */
+function drawPulses() {
+  for (const pu of G.pulses) {
+    const a = 1 - pu.age / 1.5;
+    const R = pu.age * 430;
+    const X = sx(pu.x), Y = sy(pu.y);
+    ctx.save();
+    for (let ring = 0; ring < 3; ring++) {
+      const r = R - ring * 34;
+      if (r <= 4) continue;
+      ctx.globalAlpha = a * (0.55 - ring * 0.12);
+      ctx.strokeStyle = hatchMid;
+      ctx.lineWidth = 12;
+      ctx.beginPath(); ctx.arc(X, Y, r, 0, Math.PI * 2); ctx.stroke();
+      ctx.globalAlpha = a * 0.35;
+      ctx.strokeStyle = GRAY_5;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(X, Y, r, 0, Math.PI * 2); ctx.stroke();
+    }
+    ctx.restore();
+  }
+  if (G.snapText > 0) {
+    const z = G.grizzle;
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, G.snapText * 2);
+    ctx.fillStyle = WHITE;
+    ctx.font = 'italic 700 17px Georgia, serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('*CRACK-SNAP*', sx(z.x + z.w / 2), sy(z.y - 16));
+    ctx.restore();
+  }
+}
+
+/* --- banner + rope --- */
+function drawBanner() {
+  const b = G.banner;
+  const X = sx(b.x), Y = sy(b.y);
+  if (b.state === 'hanging') {
+    // rope from beam to banner
+    ctx.strokeStyle = '#6b6455';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(sx(b.ropeX), sy(b.ropeTopY));
+    ctx.lineTo(sx(b.ropeX) + b.sway * 0.4, Y);
+    ctx.stroke();
+    // rope coil on the beam (interaction point)
+    ctx.strokeStyle = '#7d7462';
+    ctx.lineWidth = 2;
+    for (let i = 0; i < 3; i++) {
+      ctx.beginPath();
+      ctx.arc(sx(b.ropeX), sy(288) - i * 2, 7 - i, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+  // The banner cloth
+  ctx.save();
+  const swayX = b.state === 'hanging' ? b.sway : 0;
+  ctx.translate(X + swayX, Y);
+  const grad = ctx.createLinearGradient(0, 0, 0, b.h);
+  grad.addColorStop(0, '#8f897b');
+  grad.addColorStop(1, '#5c574c');
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(b.w, 0);
+  ctx.lineTo(b.w - 6, b.h - 26);
+  // ragged wavy hem
+  for (let i = 5; i >= 0; i--) {
+    ctx.lineTo(i * (b.w / 6), b.h - 26 + Math.sin(i * 2.1 + G.t * (b.state === 'hanging' ? 2 : 0)) * 12 + 14);
+  }
+  ctx.closePath();
+  ctx.fill();
+  // Liturgy sigil inked on cloth
+  ctx.strokeStyle = 'rgba(20,20,20,0.75)';
+  ctx.lineWidth = 5;
+  ctx.beginPath();
+  ctx.arc(b.w / 2, b.h * 0.38, 34, 0, Math.PI * 2);
+  ctx.moveTo(b.w / 2, b.h * 0.38 - 52);
+  ctx.lineTo(b.w / 2, b.h * 0.38 + 52);
+  ctx.stroke();
+  // fold shading
+  ctx.fillStyle = hatchStone;
+  ctx.fillRect(0, 0, b.w, b.h);
+  ctx.restore();
+
+  if (b.state === 'landed') {
+    // crumpled heap accents
+    ctx.strokeStyle = '#3c382f';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(X + 10, sy(770) - 8);
+    ctx.quadraticCurveTo(X + b.w / 2, sy(770) - 34, X + b.w - 10, sy(770) - 6);
+    ctx.stroke();
+  }
+}
+
+/* --- door --- */
+function drawDoor() {
+  const X = sx(door.x), Y = sy(door.y);
+  ctx.fillStyle = '#242019';
+  ctx.beginPath();
+  ctx.moveTo(X, Y + door.h);
+  ctx.lineTo(X, Y + 26);
+  ctx.quadraticCurveTo(X + door.w / 2, Y - 22, X + door.w, Y + 26);
+  ctx.lineTo(X + door.w, Y + door.h);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = '#0e0e0e';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+  // planks
+  ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+  ctx.lineWidth = 2;
+  for (let i = 1; i < 4; i++) {
+    ctx.beginPath();
+    ctx.moveTo(X + i * (door.w / 4), Y + 10);
+    ctx.lineTo(X + i * (door.w / 4), Y + door.h);
+    ctx.stroke();
+  }
+  // iron bands
+  ctx.strokeStyle = '#3d3d3d';
+  ctx.lineWidth = 5;
+  ctx.beginPath();
+  ctx.moveTo(X + 4, Y + 60); ctx.lineTo(X + door.w - 4, Y + 60);
+  ctx.moveTo(X + 4, Y + 130); ctx.lineTo(X + door.w - 4, Y + 130);
+  ctx.stroke();
+  // padlock / broken padlock
+  ctx.save();
+  ctx.translate(X + door.w / 2, Y + 95);
+  if (G.doorLocked) {
+    ctx.fillStyle = '#4a4a4a';
+    ctx.fillRect(-10, -6, 20, 18);
+    ctx.strokeStyle = '#4a4a4a';
+    ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.arc(0, -8, 8, Math.PI, 0); ctx.stroke();
+  } else {
+    ctx.fillStyle = COPPER;
+    ctx.globalAlpha = 0.6 + 0.4 * Math.abs(Math.sin(G.t * 4));
+    ctx.fillRect(-10, -6, 20, 18);
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = '#4a4a4a';
+    ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.arc(-6, -10, 8, Math.PI * 0.8, Math.PI * 1.9); ctx.stroke();
+  }
+  ctx.restore();
+  // Etched label
+  ctx.fillStyle = 'rgba(200,200,200,0.5)';
+  ctx.font = 'small-caps 700 13px Georgia, serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('THE LIBRARY', X + door.w / 2, Y - 30);
+}
+
+/* --- player --- */
+function drawPlayer() {
+  const p = G.player;
+  const X = sx(p.x), Y = sy(p.y);
+  const hidden = p.litFactor < 0.02;
+  ctx.save();
+  if (p.invuln > 0 && Math.floor(G.t * 12) % 2 === 0) ctx.globalAlpha = 0.35;
+  else if (hidden) ctx.globalAlpha = 0.8;
+
+  const col = hidden ? '#4a4a4a' : SILH;
+  ctx.fillStyle = col;
+  ctx.strokeStyle = col;
+
+  const cx = X + p.w / 2;
+  const run = Math.abs(p.vx) > 40 && p.grounded;
+  const step = run ? Math.sin(p.animT * (Math.abs(p.vx) > 240 ? 16 : 11)) : 0;
+
+  if (p.crouch) {
+    // Crouched: compact feline crawl
+    ctx.beginPath();
+    ctx.ellipse(cx, Y + p.h - 16, 15, 11, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(cx + p.facing * 12, Y + p.h - 24, 7, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(cx - 6, Y + p.h - 10); ctx.lineTo(cx - 6 + step * 6, Y + p.h);
+    ctx.moveTo(cx + 6, Y + p.h - 10); ctx.lineTo(cx + 6 - step * 6, Y + p.h);
+    ctx.stroke();
+  } else {
+    // Wiry runaway in a soot-stained tunic
+    // torso
+    ctx.beginPath();
+    ctx.moveTo(cx - 8, Y + 16);
+    ctx.lineTo(cx + 8, Y + 16);
+    ctx.lineTo(cx + 6, Y + 38);
+    ctx.lineTo(cx - 6, Y + 38);
+    ctx.closePath();
+    ctx.fill();
+    // head
+    ctx.beginPath();
+    ctx.arc(cx + p.facing * 2, Y + 9, 8, 0, Math.PI * 2);
+    ctx.fill();
+    // tunic tail flutter
+    ctx.beginPath();
+    ctx.moveTo(cx - p.facing * 6, Y + 30);
+    ctx.quadraticCurveTo(cx - p.facing * (14 + Math.abs(p.vx) * 0.02), Y + 36 + step * 2, cx - p.facing * 8, Y + 40);
+    ctx.fill();
+    // legs
+    ctx.lineWidth = 5;
+    if (!p.grounded) {
+      // tucked leap pose
+      ctx.beginPath();
+      ctx.moveTo(cx, Y + 38);
+      ctx.lineTo(cx + p.facing * 9, Y + 48);
+      ctx.moveTo(cx, Y + 38);
+      ctx.lineTo(cx - p.facing * 4, Y + 52);
+      ctx.stroke();
+      // reaching arm
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.moveTo(cx, Y + 20);
+      ctx.lineTo(cx + p.facing * 12, Y + 8);
+      ctx.stroke();
+    } else {
+      ctx.beginPath();
+      ctx.moveTo(cx, Y + 38);
+      ctx.lineTo(cx + step * 9, Y + p.h);
+      ctx.moveTo(cx, Y + 38);
+      ctx.lineTo(cx - step * 9, Y + p.h);
+      ctx.stroke();
+      // swinging arm
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.moveTo(cx, Y + 20);
+      ctx.lineTo(cx - step * 7, Y + 32);
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+
+  // "HIDDEN" whisper
+  if (hidden && G.state === 'play') {
+    ctx.save();
+    ctx.globalAlpha = 0.45 + 0.15 * Math.sin(G.t * 3);
+    ctx.fillStyle = GRAY_5;
+    ctx.font = 'italic 12px Georgia, serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('hidden', cx, Y - 10);
+    ctx.restore();
+  }
+
+  // Grapnel line while zipping
+  if (p.grapple) {
+    ctx.strokeStyle = GRAY_4;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(cx, Y + 10);
+    ctx.lineTo(sx(p.grapple.x + p.w / 2), sy(p.grapple.targetY + p.h));
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+
+/* --- bombs & smoke --- */
+function drawBombsSmoke() {
+  for (const b of G.bombsFly) {
+    ctx.fillStyle = SILH;
+    ctx.beginPath();
+    ctx.arc(sx(b.x), sy(b.y), 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = GRAY_4;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(sx(b.x), sy(b.y) - 6);
+    ctx.lineTo(sx(b.x) + 4, sy(b.y) - 11);
+    ctx.stroke();
+  }
+  for (const s of G.smokes) {
+    const a = clamp(s.t / 5, 0, 1);
+    ctx.save();
+    ctx.globalAlpha = 0.5 * a;
+    ctx.fillStyle = '#0a0a0a';
+    for (let i = 0; i < 6; i++) {
+      const ang = i * 1.05 + G.t * 0.6;
+      const rr = 60 + i * 22 + Math.sin(G.t * 2 + i) * 10;
+      ctx.beginPath();
+      ctx.arc(sx(s.x) + Math.cos(ang) * rr * 0.5, sy(s.y) - i * 18 - 10, 46 - i * 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+}
+
+/* --- darkness + light punching + crosshatch --- */
+function drawDarkness() {
+  darkG.clearRect(0, 0, VIEW_W, VIEW_H);
+  darkG.globalCompositeOperation = 'source-over';
+  darkG.fillStyle = 'rgba(8,8,8,0.87)';
+  darkG.fillRect(0, 0, VIEW_W, VIEW_H);
+  darkG.globalCompositeOperation = 'destination-out';
+  for (const L of G.lights) {
+    if (!lightActive(L)) continue;
+    const r = lightRadius(L);
+    const X = sx(L.x), Y = sy(L.y);
+    if (X + r < 0 || X - r > VIEW_W) continue;
+    const grad = darkG.createRadialGradient(X, Y, 0, X, Y, r);
+    grad.addColorStop(0, 'rgba(255,255,255,1)');
+    grad.addColorStop(0.55, 'rgba(255,255,255,0.96)');
+    grad.addColorStop(0.8, 'rgba(255,255,255,0.55)');
+    grad.addColorStop(1, 'rgba(255,255,255,0)');
+    darkG.fillStyle = grad;
+    darkG.beginPath();
+    darkG.arc(X, Y, r, 0, Math.PI * 2);
+    darkG.fill();
+  }
+  // Faint sight-aura around Pyre so the immediate surroundings stay readable
+  {
+    const p = G.player;
+    const X = sx(p.x + p.w / 2), Y = sy(p.y + p.h / 2);
+    const grad = darkG.createRadialGradient(X, Y, 0, X, Y, 130);
+    grad.addColorStop(0, 'rgba(255,255,255,0.55)');
+    grad.addColorStop(1, 'rgba(255,255,255,0)');
+    darkG.fillStyle = grad;
+    darkG.beginPath();
+    darkG.arc(X, Y, 130, 0, Math.PI * 2);
+    darkG.fill();
+  }
+  // Heavy crosshatch clinging to the remaining darkness
+  darkG.globalCompositeOperation = 'source-atop';
+  darkG.fillStyle = hatchDark;
+  darkG.globalAlpha = 0.5;
+  darkG.fillRect(0, 0, VIEW_W, VIEW_H);
+  darkG.globalAlpha = 1;
+  darkG.globalCompositeOperation = 'source-over';
+  ctx.drawImage(darkC, 0, 0);
+
+  // Warm copper glow blooms on the lit side
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  for (const L of G.lights) {
+    if (!lightActive(L) || L.kind === 'shaft') continue;
+    const r = lightRadius(L) * 0.8;
+    const X = sx(L.x), Y = sy(L.y);
+    if (X + r < 0 || X - r > VIEW_W) continue;
+    const grad = ctx.createRadialGradient(X, Y, 0, X, Y, r);
+    grad.addColorStop(0, 'rgba(217,119,6,0.10)');
+    grad.addColorStop(1, 'rgba(217,119,6,0)');
+    ctx.fillStyle = grad;
+    ctx.beginPath(); ctx.arc(X, Y, r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.restore();
+}
+
+/* --- flames drawn above darkness (they glow) --- */
+function drawFlames() {
+  for (const L of G.lights) {
+    if (L.kind === 'shaft' || !lightActive(L)) continue;
+    const X = sx(L.x), Y = sy(L.y);
+    const f = flick(G.t, L.seed);
+    const positions = L.kind === 'candle'
+      ? [[-34, 0], [0, -8], [34, 0]]
+      : [[0, 0]];
+    for (const [ox, oy] of positions) {
+      const h = (L.kind === 'torch' ? 20 : 13) * (1 + 0.2 * f);
+      ctx.save();
+      ctx.translate(X + ox, Y + oy);
+      ctx.fillStyle = COPPER;
+      ctx.beginPath();
+      ctx.moveTo(0, 2);
+      ctx.quadraticCurveTo(-5, -h * 0.4, 0 + f * 2, -h);
+      ctx.quadraticCurveTo(5, -h * 0.4, 0, 2);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(255,220,160,0.85)';
+      ctx.beginPath();
+      ctx.ellipse(f, -h * 0.28, 2, 4, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+}
+
+/* --- interaction prompts --- */
+function drawPrompts() {
+  const p = G.player;
+  const b = G.banner;
+  ctx.textAlign = 'center';
+  if (b.state === 'hanging' &&
+      Math.abs((p.x + p.w / 2) - b.ropeX) < 70 && Math.abs((p.y + p.h) - 290) < 60) {
+    const X = sx(b.ropeX), Y = sy(252);
+    ctx.fillStyle = 'rgba(10,10,10,0.85)';
+    ctx.fillRect(X - 72, Y - 18, 144, 26);
+    ctx.strokeStyle = GRAY_5; ctx.lineWidth = 1;
+    ctx.strokeRect(X - 72, Y - 18, 144, 26);
+    ctx.fillStyle = WHITE;
+    ctx.font = 'small-caps 700 15px Georgia, serif';
+    ctx.fillText('[E]  CUT ROPE', X, Y);
+  }
+  if (rectsOverlap(p, door)) {
+    const X = sx(door.x + door.w / 2), Y = sy(door.y - 54);
+    ctx.fillStyle = WHITE;
+    ctx.font = 'small-caps 700 15px Georgia, serif';
+    ctx.fillText(G.doorLocked ? 'SEALED BY RITUAL LAW' : 'THE WAY IS OPEN', X, Y);
+  }
+  // Tutorial scrawls near the start, as if inked on the stone
+  ctx.font = 'italic 15px Georgia, serif';
+  ctx.fillStyle = 'rgba(190,190,190,0.55)';
+  ctx.fillText('A / D  —  move       SHIFT — sprint       S — crouch (silence)', sx(280), sy(240));
+  ctx.fillText('W — leap', sx(430), sy(500));
+  ctx.fillText('leap wall-to-wall to climb the chimney', sx(680), sy(180));
+  ctx.fillText('Q — soot bomb        F — grapnel to a beam above', sx(1030), sy(230));
+  ctx.fillText('stay out of the light. crouch when the Click-Snap draws near.', sx(1450), sy(230));
+}
+
+/* ---------------- UI ---------------- */
+function drawStitchedHeart(x, y, alive, cracked) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(1.15, 1.15);
+  ctx.beginPath();
+  ctx.moveTo(0, 5);
+  ctx.bezierCurveTo(-2, -1, -11, -2, -11, 4);
+  ctx.bezierCurveTo(-11, 10, -3, 14, 0, 18);
+  ctx.bezierCurveTo(3, 14, 11, 10, 11, 4);
+  ctx.bezierCurveTo(11, -2, 2, -1, 0, 5);
+  ctx.closePath();
+  ctx.fillStyle = alive ? '#d8d4c8' : '#2c2c2c';
+  ctx.fill();
+  ctx.strokeStyle = alive ? '#111' : '#444';
+  ctx.lineWidth = 1.6;
+  ctx.setLineDash([3, 2]); // stitching
+  ctx.stroke();
+  ctx.setLineDash([]);
+  if (cracked) {
+    ctx.strokeStyle = '#111';
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.moveTo(0, -1); ctx.lineTo(-2, 5); ctx.lineTo(2, 9); ctx.lineTo(-1, 15);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawMeter(x, y, w, h, frac, label, fillCol) {
+  ctx.fillStyle = 'rgba(8,8,8,0.7)';
+  ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = fillCol;
+  ctx.fillRect(x + 2, y + 2, (w - 4) * clamp(frac, 0, 1), h - 4);
+  ctx.strokeStyle = GRAY_4;
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(x, y, w, h);
+  ctx.fillStyle = GRAY_5;
+  ctx.font = 'small-caps 700 12px Georgia, serif';
+  ctx.textAlign = 'left';
+  ctx.fillText(label, x, y - 5);
+}
+
+function drawUI() {
+  const p = G.player;
+  ctx.save();
+  ctx.textBaseline = 'alphabetic';
+
+  // Title strip
+  ctx.fillStyle = 'rgba(220,218,210,0.9)';
+  ctx.font = 'small-caps 700 17px Georgia, serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('The Groaning Pile: Shadows of the Rafter-Lands', 20, 30);
+
+  // Hearts
+  for (let i = 0; i < 3; i++) {
+    drawStitchedHeart(34 + i * 34, 46, i < p.health, i === p.health);
+  }
+
+  // Meters
+  drawMeter(20, 96, 190, 12, p.stamina / 100, 'Fortitude', '#9fb4bd');
+  if (p.awareness > 1) {
+    const puls = p.awareness > 70 ? 0.5 + 0.5 * Math.abs(Math.sin(G.t * 8)) : 1;
+    ctx.globalAlpha = puls;
+    drawMeter(20, 128, 190, 12, p.awareness / 100, 'Awareness', p.awareness > 70 ? '#e5e5e5' : '#b5b5b5');
+    ctx.globalAlpha = 1;
+    if (p.awareness > 70) {
+      ctx.fillStyle = WHITE;
+      ctx.font = 'italic 700 13px Georgia, serif';
+      ctx.fillText('THEY SEE YOU', 220, 138);
+    }
+  }
+
+  // Inventory (left rail, like carved niches)
+  const items = [
+    { label: 'Q', count: p.bombs, draw: (x, y) => { // soot bomb
+        ctx.fillStyle = '#d0d0d0';
+        ctx.beginPath(); ctx.arc(x, y + 3, 8, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = '#d0d0d0'; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(x, y - 5); ctx.lineTo(x + 5, y - 11); ctx.stroke();
+      } },
+    { label: 'F', count: -1, draw: (x, y) => { // grapnel
+        ctx.strokeStyle = '#d0d0d0'; ctx.lineWidth = 2.5;
+        ctx.beginPath(); ctx.moveTo(x, y - 8); ctx.lineTo(x, y + 4); ctx.stroke();
+        ctx.beginPath(); ctx.arc(x, y + 6, 6, Math.PI * 0.1, Math.PI * 0.95); ctx.stroke();
+      } }
+  ];
+  for (let i = 0; i < items.length; i++) {
+    const bx = 22, by = 180 + i * 56;
+    ctx.fillStyle = 'rgba(12,12,12,0.75)';
+    ctx.fillRect(bx, by, 44, 44);
+    ctx.strokeStyle = '#4c4c4c';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(bx, by, 44, 44);
+    items[i].draw(bx + 22, by + 20);
+    ctx.fillStyle = GRAY_5;
+    ctx.font = '700 11px Georgia, serif';
+    ctx.textAlign = 'right';
+    ctx.fillText(items[i].label, bx + 40, by + 40);
+    if (items[i].count >= 0) {
+      ctx.textAlign = 'left';
+      ctx.fillStyle = WHITE;
+      ctx.fillText('×' + items[i].count, bx + 4, by + 40);
+    }
+  }
+
+  // Objective banner (bottom center, gothic scrawl)
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(180,178,168,0.75)';
+  ctx.font = 'small-caps 700 14px Georgia, serif';
+  ctx.fillText('CURRENT GOAL:', VIEW_W / 2, VIEW_H - 44);
+  ctx.fillStyle = 'rgba(235,233,225,0.92)';
+  ctx.font = 'small-caps 700 19px Georgia, serif';
+  ctx.fillText(G.objective, VIEW_W / 2, VIEW_H - 20);
+
+  // Escape timer
+  if (G.escapeActive) {
+    const t = Math.max(0, G.escapeT);
+    ctx.fillStyle = t < 3 ? WHITE : 'rgba(235,233,225,0.95)';
+    ctx.font = '700 54px Georgia, serif';
+    ctx.globalAlpha = t < 3 ? 0.6 + 0.4 * Math.abs(Math.sin(G.t * 10)) : 1;
+    ctx.fillText(t.toFixed(1), VIEW_W / 2, 90);
+    ctx.globalAlpha = 1;
+    ctx.font = 'small-caps 700 16px Georgia, serif';
+    ctx.fillText('ESCAPE BEFORE THEY RECOVER', VIEW_W / 2, 116);
+  }
+  if (G.alarm) {
+    ctx.fillStyle = WHITE;
+    ctx.globalAlpha = 0.5 + 0.5 * Math.abs(Math.sin(G.t * 6));
+    ctx.font = 'small-caps 700 22px Georgia, serif';
+    ctx.fillText('— ALARM —', VIEW_W / 2, 60);
+    ctx.globalAlpha = 1;
+  }
+
+  // Transient message
+  if (G.msgT > 0) {
+    ctx.fillStyle = 'rgba(235,233,225,' + clamp(G.msgT, 0, 1) + ')';
+    ctx.font = 'italic 700 18px Georgia, serif';
+    ctx.fillText(G.msg, VIEW_W / 2, 150);
+  }
+  ctx.restore();
+}
+
+/* ---------------- Overlays: parchment noise + vignette ---------------- */
+function drawGrainAndVignette() {
+  ctx.save();
+  ctx.globalAlpha = 0.5;
+  ctx.drawImage(noiseC, 0, 0);
+  ctx.restore();
+  const v = ctx.createRadialGradient(VIEW_W / 2, VIEW_H / 2, VIEW_H * 0.42, VIEW_W / 2, VIEW_H / 2, VIEW_H * 0.85);
+  v.addColorStop(0, 'rgba(0,0,0,0)');
+  v.addColorStop(1, 'rgba(0,0,0,0.55)');
+  ctx.fillStyle = v;
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+}
+
+/* ---------------- Screens ---------------- */
+function drawMenu() {
+  ctx.fillStyle = '#141414';
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  // ambient arches
+  ctx.strokeStyle = '#242424';
+  ctx.lineWidth = 3;
+  for (let i = 0; i < 6; i++) {
+    const ax = i * 260 - (G.t * 8 % 260);
+    ctx.beginPath();
+    ctx.moveTo(ax, 640);
+    ctx.quadraticCurveTo(ax + 130, 120, ax + 260, 640);
+    ctx.stroke();
+  }
+  // one candle
+  const cx = VIEW_W / 2, cy = 500;
+  const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, 300);
+  grad.addColorStop(0, 'rgba(217,119,6,0.12)');
+  grad.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  ctx.fillStyle = '#c9c4b4';
+  ctx.fillRect(cx - 4, cy - 10, 8, 28);
+  const f = flick(G.t, 1);
+  ctx.fillStyle = COPPER;
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - 8);
+  ctx.quadraticCurveTo(cx - 6, cy - 22, cx + f * 3, cy - 34 - f * 4);
+  ctx.quadraticCurveTo(cx + 6, cy - 22, cx, cy - 8);
+  ctx.fill();
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#e8e5dc';
+  ctx.font = 'small-caps 700 52px Georgia, serif';
+  ctx.fillText('The Groaning Pile', VIEW_W / 2, 190);
+  ctx.font = 'small-caps 700 24px Georgia, serif';
+  ctx.fillStyle = GRAY_5;
+  ctx.fillText('— Shadows of the Rafter-Lands —', VIEW_W / 2, 232);
+
+  ctx.font = 'italic 16px Georgia, serif';
+  ctx.fillStyle = '#9a978c';
+  const story = [
+    'You are Pyre, runaway of the Choking Scullery.',
+    'The doors of the Pile are sealed by Ritual Law, and the Arch-Liturge preaches below.',
+    'Cross the rafters. Stay in shadow. Track blind Grizzle by the crack-snap of his knees.',
+    'Cut the great banner down upon the Liturgy — and in the chaos, reach the Library Door.'
+  ];
+  story.forEach((s, i) => ctx.fillText(s, VIEW_W / 2, 292 + i * 26));
+
+  ctx.font = '14px Georgia, serif';
+  ctx.fillStyle = GRAY_4;
+  ctx.fillText('WASD / Arrows — move & leap      SHIFT — sprint      S — crouch (silent)', VIEW_W / 2, 566);
+  ctx.fillText('E — interact      Q — soot bomb      F — grapnel      (crouch + leap to drop through beams)', VIEW_W / 2, 590);
+
+  ctx.font = 'small-caps 700 22px Georgia, serif';
+  ctx.fillStyle = 'rgba(235,233,225,' + (0.5 + 0.5 * Math.abs(Math.sin(G.t * 2.4))) + ')';
+  ctx.fillText('press ENTER to defy the Liturgy', VIEW_W / 2, 656);
+
+  drawGrainAndVignette();
+}
+
+function drawCapturedOverlay() {
+  ctx.fillStyle = 'rgba(0,0,0,' + clamp((1.7 - G.capturedT) * 1.4, 0, 0.82) + ')';
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = WHITE;
+  ctx.font = 'small-caps 700 46px Georgia, serif';
+  ctx.fillText('CAPTURED', VIEW_W / 2, VIEW_H / 2 - 16);
+  ctx.font = 'italic 18px Georgia, serif';
+  ctx.fillStyle = GRAY_5;
+  ctx.fillText(G.capturedMsg, VIEW_W / 2, VIEW_H / 2 + 22);
+}
+
+function drawGameOver() {
+  ctx.fillStyle = '#0a0a0a';
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#d8d4c8';
+  ctx.font = 'small-caps 700 48px Georgia, serif';
+  ctx.fillText('THE LITURGY ENDURES', VIEW_W / 2, 300);
+  ctx.font = 'italic 18px Georgia, serif';
+  ctx.fillStyle = GRAY_4;
+  ctx.fillText('Pyre is dragged below, to scour the vats until his name is forgotten.', VIEW_W / 2, 350);
+  ctx.font = 'small-caps 700 20px Georgia, serif';
+  ctx.fillStyle = 'rgba(235,233,225,' + (0.5 + 0.5 * Math.abs(Math.sin(G.t * 2.4))) + ')';
+  ctx.fillText('press ENTER to rise again', VIEW_W / 2, 440);
+  drawGrainAndVignette();
+}
+
+function drawVictory() {
+  G.victoryT += 1 / 60;
+  ctx.fillStyle = '#101010';
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  // Rising smoke over a flooded, silent empire of stone
+  ctx.strokeStyle = '#232323';
+  ctx.lineWidth = 2;
+  for (let i = 0; i < 20; i++) {
+    const rx = (i * 173) % VIEW_W;
+    const rh = 80 + (i * 97) % 200;
+    ctx.strokeRect(rx, 520 - rh, 60, rh);
+  }
+  ctx.fillStyle = 'rgba(30,30,34,0.9)';
+  ctx.fillRect(0, 520, VIEW_W, 200); // floodwater
+  ctx.strokeStyle = 'rgba(90,90,95,0.35)';
+  for (let i = 0; i < 10; i++) {
+    ctx.beginPath();
+    const wy = 540 + i * 18;
+    ctx.moveTo(0, wy);
+    for (let x = 0; x <= VIEW_W; x += 40) ctx.lineTo(x, wy + Math.sin(x * 0.02 + G.t * 1.5 + i) * 3);
+    ctx.stroke();
+  }
+  const glow = ctx.createRadialGradient(VIEW_W / 2, 200, 0, VIEW_W / 2, 200, 420);
+  glow.addColorStop(0, 'rgba(217,119,6,0.10)');
+  glow.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = glow;
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#e8e5dc';
+  ctx.font = 'small-caps 700 46px Georgia, serif';
+  ctx.fillText('THE DOOR YIELDS', VIEW_W / 2, 170);
+  ctx.font = 'italic 17px Georgia, serif';
+  ctx.fillStyle = '#9a978c';
+  const lines = [
+    'The banner smothers the Arch-Liturgy’s sermon; the wardens claw at cloth and soot.',
+    'Pyre slips through the Library Door as the bells fall out of rhythm for the first time in centuries.',
+    'Somewhere above wait the Rafter-Lands, Lady Bramble’s greenhouse, and the rising flood.',
+    '',
+    'The Great Sabotage has begun.'
+  ];
+  lines.forEach((s, i) => ctx.fillText(s, VIEW_W / 2, 230 + i * 28));
+
+  ctx.font = 'small-caps 700 20px Georgia, serif';
+  ctx.fillStyle = 'rgba(235,233,225,' + (0.5 + 0.5 * Math.abs(Math.sin(G.t * 2.4))) + ')';
+  ctx.fillText('press ENTER to play again', VIEW_W / 2, 640);
+  drawGrainAndVignette();
+}
+
+/* ---------------- Main render ---------------- */
+function render() {
+  if (G.state === 'menu')    { drawMenu(); return; }
+  if (G.state === 'gameover'){ drawGameOver(); return; }
+  if (G.state === 'victory') { drawVictory(); return; }
+
+  drawBackground();
+  drawPlatforms();
+  drawFixtures();
+  drawSiltAndFlock();
+  drawBanner();
+  drawDoor();
+  drawPatrolGuards();
+  drawGrizzle(false);
+  drawDarkness();
+  drawFlames();
+  drawPlayer();
+  drawBombsSmoke();
+  drawPulses();
+  drawGrizzle(true);
+  drawPrompts();
+  drawGrainAndVignette();
+  drawUI();
+
+  if (G.state === 'captured') drawCapturedOverlay();
+}
+
+/* ---------------- Update dispatch ---------------- */
+function update(dt) {
+  G.t += dt;
+  G.msgT = Math.max(0, G.msgT - dt);
+
+  if (G.state === 'menu') {
+    if (K.enterP()) { resetRun(true); G.state = 'play'; }
+    return;
+  }
+  if (G.state === 'gameover' || G.state === 'victory') {
+    if (K.enterP()) { resetRun(true); G.state = 'menu'; }
+    return;
+  }
+  if (G.state === 'captured') {
+    G.capturedT -= dt;
+    updateCamera(dt);
+    if (G.capturedT <= 0) {
+      if (G.player.health <= 0) G.state = 'gameover';
+      else { G.state = 'play'; respawn(); }
+    }
+    return;
+  }
+
+  // play
+  updatePlayer(dt);
+  if (G.state !== 'play') { updateCamera(dt); return; } // capture/victory happened mid-update
+  updateGrizzle(dt);
+  updateGuards(dt);
+  updateBanner(dt);
+  updateBombs(dt);
+  updateEscape(dt);
+  updateCamera(dt);
+}
+
+/* ---------------- Loop ---------------- */
+let lastT = performance.now();
+function frame(now) {
+  let dt = (now - lastT) / 1000;
+  lastT = now;
+  dt = clamp(dt, 0, 1 / 20); // spike guard
+  update(dt);
+  render();
+  for (const k in pressed) pressed[k] = false;
+  requestAnimationFrame(frame);
+}
+
+/* ---------------- Responsive scale ---------------- */
+function fit() {
+  const s = Math.min(window.innerWidth / VIEW_W, window.innerHeight / VIEW_H);
+  canvas.style.width  = Math.floor(VIEW_W * s) + 'px';
+  canvas.style.height = Math.floor(VIEW_H * s) + 'px';
+}
+window.addEventListener('resize', fit);
+fit();
+
+resetRun(true);
+requestAnimationFrame(frame);
+
+/* Debug/testing hook */
+window.GAME = G;
+</script>
+</body>
+</html>
